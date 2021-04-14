@@ -18,3 +18,10 @@ type RedisClient interface {
 	RPop(ctx context.Context, key string) *redis.StringCmd
 	LLen(ctx context.Context, key string) *redis.IntCmd
 }
+
+// Logger can be logrus or zap sugared logger, or your own.
+type Logger interface {
+	Debugf(format string, args ...interface{})
+	Infof(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
+}
