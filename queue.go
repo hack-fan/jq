@@ -11,15 +11,8 @@ import (
 
 // Queue is just one queue
 type Queue struct {
-	name     string
-	rdb      RedisClient
-	queueKey string
-	errorKey string
-
-	// these is used for watcher, optional.
-	receiveKey string
-	successKey string
-	failKey    string
+	name string
+	rdb  RedisClient
 }
 
 // NewQueue create a queue
@@ -57,4 +50,21 @@ func (q *Queue) PubTo(name string, payload interface{}) (string, error) {
 		return "", fmt.Errorf("push job to redis failed: %w", err)
 	}
 	return job.ID, nil
+}
+
+// Get a single job from redis.
+// The error returned would be redis.Nil, use errors.Is to check it.
+// This is not normally used, unless you want to write your own worker.
+// You can use our out of box StartWorker()
+func (q *Queue) Get(ctx context.Context) (*Job, error) {
+	data, err := q.rdb.RPop(ctx, q.name+":queue").Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("get job from redis failed: %w", err)
+	}
+	var job = new(Job)
+	err = msgpack.Unmarshal(data, job)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal job failed: %w", err)
+	}
+	return job, nil
 }
