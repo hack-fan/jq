@@ -6,98 +6,124 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"golang.org/x/sync/semaphore"
 )
 
+// HandlerFunc is your custom function to process job.
+// Notice: It must be thread safe, since it will be called parallel.
 type HandlerFunc func(job *Job) error
 
 // WorkerOptions is optional when starting a worker
 type WorkerOptions struct {
 	// If job handler fails,max retry these times. Default:10
 	MaxRetry int
-	// Parallel worker count. Default:1
-	Parallel int
+	// Parallel worker count. Default:2
+	Parallel int64
 	// If there is no job, worker will take a break Default: 3s
 	Interval time.Duration
-	// If the workers are inactive during these duration, watcher will do a report. Default: 10min
+	// If the workers are inactive during these duration, watcher will do a report. Default: 3min
 	Idle time.Duration
+	// If a redis server error occurred, wait and retry. Default: 1min
+	Recover time.Duration
 	// You can use your own logger
 	Logger Logger
 }
 
+func (opt *WorkerOptions) ensure() {
+	if opt == nil {
+		*opt = WorkerOptions{}
+	}
+	if opt.MaxRetry == 0 {
+		opt.MaxRetry = 10
+	}
+	if opt.Parallel == 0 {
+		opt.Parallel = 2
+	}
+	if opt.Interval == 0 {
+		opt.Interval = time.Second * 3
+	}
+	if opt.Idle == 0 {
+		opt.Idle = time.Minute * 3
+	}
+	if opt.Recover == 0 {
+		opt.Recover = time.Minute * 1
+	}
+}
+
 // StartWorker is blocked.
 func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *WorkerOptions) {
-	var max = 10
-	// var parallel = 1
-	var interval = time.Second * 3
-	var idle = time.Minute * 10
-	var log = defaultLogger{}
-	// var sem = semaphore.NewWeighted(int64(max))
-	log.Infof("job queue worker %s start", q.name)
+	// Parse options
+	opt.ensure()
+	// overwrite logger
+	if opt.Logger != nil {
+		q.log = opt.Logger
+	}
+	// Start the ever loop
+	var sem = semaphore.NewWeighted(opt.Parallel)
+	q.log.Infof("job queue worker %s start", q.name)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Infof("job queue %s stopped by context done signal", q.name)
+			q.log.Infof("job queue %s stopped by context done signal", q.name)
 			return
 		default:
-			job, err := q.Get(ctx)
-			if err == redis.Nil {
-				// Empty queue, wait a while
-				sleep(ctx, interval)
-				continue
-			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				log.Errorf("context dead: %s", err)
-				continue
-			} else if err != nil {
-				log.Errorf("job queue %s get job error: %s", q.name, err)
-				// Perhaps redis down,network error,sleep and retry
-				sleep(ctx, time.Minute)
+			// Acquire sem, the only error here will be context error,
+			// continue for done case if it happens.
+			err := sem.Acquire(ctx, 1)
+			if err != nil {
 				continue
 			}
-			start := time.Now()
-			err = handle(job)
-			if err != nil {
-				log.Errorf("[%s] job [%s] used %s failed: %s", q.name, job.ID, time.Since(start), err)
-				// Count fail
-				err := q.rdb.HIncrBy(ctx, q.name+":count", "failed", 1).Err()
+			// Async run job for parallel.
+			go func() {
+				defer sem.Release(1)
+				// Step 1: Get job
+				job, err := q.Get(ctx)
+				if err == redis.Nil {
+					// Empty queue, wait a while
+					sleep(ctx, opt.Interval)
+					return
+				} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					q.log.Errorf("context dead: %s", err)
+					return
+				} else if err != nil {
+					q.log.Errorf("job queue %s get job error: %s", q.name, err)
+					// Perhaps redis down,network error,sleep and retry
+					sleep(ctx, opt.Recover)
+					return
+				}
+				q.count(ctx, "process", opt)
+				// Step 2: Handle job
+				start := time.Now()
+				err = handle(job)
 				if err != nil {
-					log.Errorf("job queue %s count failed error: %s", q.name, err)
-					continue
+					q.log.Errorf("[%s] job [%s] used %s failed: %s", q.name, job.ID, time.Since(start), err)
+					// Count failed
+					q.count(ctx, "failed", opt)
+					// Retry or not
+					if job.Retried >= opt.MaxRetry {
+						q.log.Errorf("[%s] job [%s] retry limit exceeded: %s", q.name, job.ID, time.Since(start))
+						return
+					}
+					go q.Retry(ctx, job)
+					return
 				}
-				err = q.rdb.Expire(ctx, q.name+":count", idle).Err()
-				if err != nil {
-					log.Errorf("job queue %s count failed ttl error: %s", q.name, err)
-					continue
-				}
-				// Retry or not
-				if job.Retried >= max {
-					log.Infof("[%s] job [%s] retry limit exceeded: %s", q.name, job.ID, time.Since(start))
-					continue
-				}
-				// 等等再加到队列，防止最后一个任务失败光速重试
-				job.Retried += 1
-				go func() {
-					sleep(ctx, time.Second*time.Duration(job.Retried))
-					// FIXME:
-					// err := q.Pub(job)
-					// if err != nil {
-					// 	xim.Errorf("队列%s的任务[%s]添加到重试队列时失败，放弃:%s", dq.key, job.ID, err)
-					// }
-				}()
-				// Handler error end
-				continue
-			}
-			log.Infof("[%s] job [%s] used %s", q.name, job.ID, time.Since(start))
-			// Count success
-			err = q.rdb.HIncrBy(ctx, q.name+":count", "success", 1).Err()
-			if err != nil {
-				log.Errorf("job queue %s count success error: %s", q.name, err)
-				continue
-			}
-			err = q.rdb.Expire(ctx, q.name+":count", idle).Err()
-			if err != nil {
-				log.Errorf("job queue %s count success ttl error: %s", q.name, err)
-				continue
-			}
+				q.log.Infof("[%s] job [%s] used %s", q.name, job.ID, time.Since(start))
+				// Count success
+				q.count(ctx, "success", opt)
+			}()
 		}
+	}
+}
+
+// count receive,success,failed jobs
+// the value will be cleared when idle time reached opt.Idle
+func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
+	key := q.name + ":count"
+	pipe := q.rdb.TxPipeline()
+	pipe.HIncrBy(ctx, key, field, 1)
+	pipe.Expire(ctx, key, opt.Idle)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		q.log.Errorf("job queue %s count %s failed: %s", q.name, err)
 	}
 }

@@ -18,6 +18,7 @@ type RedisClient interface {
 	LPush(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
 	RPop(ctx context.Context, key string) *redis.StringCmd
 	LLen(ctx context.Context, key string) *redis.IntCmd
+	TxPipeline() redis.Pipeliner
 }
 
 // Logger can be logrus or zap sugared logger, or your own.
@@ -33,10 +34,3 @@ type defaultLogger struct{}
 func (defaultLogger) Debugf(_ string, _ ...interface{}) {}
 func (defaultLogger) Infof(_ string, _ ...interface{})  {}
 func (defaultLogger) Errorf(_ string, _ ...interface{}) {}
-
-func sleep(ctx context.Context, duration time.Duration) {
-	select {
-	case <-ctx.Done():
-	case <-time.After(duration):
-	}
-}

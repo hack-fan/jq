@@ -13,6 +13,7 @@ import (
 type Queue struct {
 	name string
 	rdb  RedisClient
+	log  Logger
 }
 
 // NewQueue create a queue
@@ -20,6 +21,7 @@ func NewQueue(name string, rdb RedisClient) *Queue {
 	return &Queue{
 		name: name,
 		rdb:  rdb,
+		log:  defaultLogger{},
 	}
 }
 
@@ -35,26 +37,35 @@ func (q *Queue) PubTo(name string, payload interface{}) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("your payload can not be marshalled by msgpack: %w", err)
 	}
-	var job = Job{
+	var job = &Job{
 		ID:      xid.New().String(),
 		PubAt:   time.Now(),
 		Retried: 0,
 		Payload: tmp,
 	}
-	data, err := msgpack.Marshal(job)
+	err = q.publish(name, job)
 	if err != nil {
-		return "", fmt.Errorf("your payload can not be marshalled by msgpack: %w", err)
-	}
-	err = q.rdb.LPush(context.Background(), name+":queue", data).Err()
-	if err != nil {
-		return "", fmt.Errorf("push job to redis failed: %w", err)
+		return "", err
 	}
 	return job.ID, nil
 }
 
+// publish <job> to <queue>
+func (q *Queue) publish(queue string, job *Job) error {
+	data, err := msgpack.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("your payload can not be marshalled by msgpack: %w", err)
+	}
+	err = q.rdb.LPush(context.Background(), queue+":queue", data).Err()
+	if err != nil {
+		return fmt.Errorf("push job to redis failed: %w", err)
+	}
+	return nil
+}
+
 // Get a single job from redis.
 // The error returned would be redis.Nil, use errors.Is to check it.
-// This is not normally used, unless you want to write your own worker.
+// This function is not normally used, unless you want to write your own worker.
 // You can use our out of box StartWorker()
 func (q *Queue) Get(ctx context.Context) (*Job, error) {
 	data, err := q.rdb.RPop(ctx, q.name+":queue").Bytes()
@@ -67,4 +78,25 @@ func (q *Queue) Get(ctx context.Context) (*Job, error) {
 		return nil, fmt.Errorf("unmarshal job failed: %w", err)
 	}
 	return job, nil
+}
+
+// Retry the job, before sending job to queue, it will sleep a while.
+// Use context signal to control this sleep, if worker will restart.
+// This function is not normally used, unless you want to write your own worker.
+// You can use our out of box StartWorker()
+func (q *Queue) Retry(ctx context.Context, job *Job) {
+	sleep(ctx, time.Second*time.Duration(job.Retried))
+	job.Retried += 1
+	err := q.publish(q.name, job)
+	if err != nil {
+		q.log.Errorf("send retry job %s to queue %s failed: %s", job.ID, q.name, err)
+	}
+}
+
+// sleep to ctx done or duration, the lesser one.
+func sleep(ctx context.Context, duration time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(duration):
+	}
 }
