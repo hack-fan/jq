@@ -13,6 +13,7 @@ type RedisClient interface {
 	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
 	HIncrBy(ctx context.Context, key, field string, incr int64) *redis.IntCmd
+	HGetAll(ctx context.Context, key string) *redis.StringStringMapCmd
 	Exists(ctx context.Context, keys ...string) *redis.IntCmd
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
 	LPush(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
