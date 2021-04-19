@@ -25,6 +25,9 @@ type WorkerOptions struct {
 	Idle time.Duration
 	// If a redis server error occurred, wait and retry. Default: 1min
 	Recover time.Duration
+	// If a job exceeds the max retry time, save it to dropped queue, or really dropped.
+	// Default is false, avoiding memory leaks.
+	SafeDrop bool
 	// You can use your own logger
 	Logger Logger
 }
@@ -103,7 +106,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 					if job.Retried >= opt.MaxRetry {
 						q.log.Errorf("[%s] job [%s] retry limit exceeded: %s", q.name, job.ID, time.Since(start))
 						q.count(ctx, "dropped", opt)
-						q.count(ctx, "final", opt)
+						q.Drop(job)
 						return
 					}
 					go q.Retry(ctx, job)
@@ -112,13 +115,12 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 				q.log.Infof("[%s] job [%s] used %s", q.name, job.ID, time.Since(start))
 				// Count success
 				q.count(ctx, "success", opt)
-				q.count(ctx, "final", opt)
 			}()
 		}
 	}
 }
 
-// count process,success,failed,dropped,final jobs
+// count process,success,failed,dropped jobs
 // the value will be cleared when idle time reached opt.Idle
 func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
 	key := q.name + ":count"

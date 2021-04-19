@@ -93,6 +93,18 @@ func (q *Queue) Retry(ctx context.Context, job *Job) {
 	}
 }
 
+// Drop the job,put it to drop queue,if SafeDrop is true.
+func (q *Queue) Drop(job *Job) {
+	data, err := msgpack.Marshal(job)
+	if err != nil {
+		q.log.Errorf("your payload can not be marshalled by msgpack: %s", err)
+	}
+	err = q.rdb.LPush(context.Background(), q.name+":dropped", data).Err()
+	if err != nil {
+		q.log.Errorf("push job to redis failed: %s", err)
+	}
+}
+
 // sleep to ctx done or duration, the lesser one.
 func sleep(ctx context.Context, duration time.Duration) {
 	select {
