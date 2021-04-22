@@ -81,7 +81,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 				defer sem.Release(1)
 				// Step 1: Get job
 				job, err := q.Get(ctx)
-				if err == redis.Nil {
+				if errors.Is(err, redis.Nil) {
 					// Empty queue, wait a while
 					sleep(ctx, opt.Interval)
 					return
