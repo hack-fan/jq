@@ -86,7 +86,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 					sleep(ctx, opt.Interval)
 					return
 				} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					q.log.Errorf("context dead: %s", err)
+					q.log.Infof("context dead: %s", err)
 					return
 				} else if err != nil {
 					q.log.Errorf("job queue %s get job error: %s", q.name, err)
