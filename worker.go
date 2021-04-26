@@ -3,6 +3,7 @@ package jq
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -30,6 +31,8 @@ type WorkerOptions struct {
 	SafeDrop bool
 	// You can use your own logger
 	Logger Logger
+	// If you pass a wait group in,worker will release it in the end of life.
+	WG *sync.WaitGroup
 }
 
 func (opt *WorkerOptions) ensure() {
@@ -57,6 +60,10 @@ func (opt *WorkerOptions) ensure() {
 func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *WorkerOptions) {
 	// Parse options
 	opt.ensure()
+	// Wait group
+	if opt.WG != nil {
+		defer opt.WG.Done()
+	}
 	// overwrite logger
 	if opt.Logger != nil {
 		q.log = opt.Logger
