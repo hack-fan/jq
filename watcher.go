@@ -57,6 +57,26 @@ func (q *Queue) Status() (*Status, error) {
 	return status, nil
 }
 
+// count process,success,failed,dropped jobs
+// the value will be cleared when idle time reached opt.Idle
+func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
+	pipe := q.rdb.TxPipeline()
+	pipe.HIncrBy(ctx, q.name+":count", field, 1)
+	pipe.Set(ctx, q.name+":active", time.Now(), 0)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		q.log.Errorf("job queue %s count %s failed: %s", q.name, err)
+	}
+}
+
+// reset the counter
+func (q *Queue) reset() {
+	err := q.rdb.Del(context.Background(), q.name+":count").Err()
+	if err != nil {
+		q.log.Errorf("queue %s reset counter failed:%s", q.name, err)
+	}
+}
+
 func (q *Queue) activeAt() time.Time {
 	var res = time.Now()
 	err := q.rdb.Get(context.Background(), q.name+":active").Scan(&res)

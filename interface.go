@@ -11,6 +11,7 @@ import (
 type RedisClient interface {
 	Get(ctx context.Context, key string) *redis.StringCmd
 	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd
+	Del(ctx context.Context, keys ...string) *redis.IntCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
 	HIncrBy(ctx context.Context, key, field string, incr int64) *redis.IntCmd
 	HGetAll(ctx context.Context, key string) *redis.StringStringMapCmd

@@ -22,7 +22,7 @@ type WorkerOptions struct {
 	Parallel int64
 	// If there is no job, worker will take a break Default: 3s
 	Interval time.Duration
-	// If the workers are inactive during these duration, watcher will clear count and do a report. Default: 3min
+	// If the workers are inactive during these duration, watcher will clear count and make a report. Default: 3min
 	Idle time.Duration
 	// Working together with "Idle",custom your report.
 	ReportFunc func(status *Status)
@@ -80,12 +80,13 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 			return
 		default:
 			// Make a report if the queue has been idle for a while
-			if opt.ReportFunc != nil {
-				if q.activeAt().Add(opt.Idle).Before(time.Now()) {
-					status, err := q.Status()
-					if err != nil {
-						q.log.Errorf("queue %s get status failed:%s", q.name, err)
-					} else {
+			if opt.ReportFunc != nil && q.activeAt().Add(opt.Idle).Before(time.Now()) {
+				status, err := q.Status()
+				if err != nil {
+					q.log.Errorf("queue %s get status failed:%s", q.name, err)
+				} else {
+					if status.IsRunning {
+						q.reset()
 						opt.ReportFunc(status)
 					}
 				}
@@ -137,17 +138,5 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 				q.count(ctx, "success", opt)
 			}()
 		}
-	}
-}
-
-// count process,success,failed,dropped jobs
-// the value will be cleared when idle time reached opt.Idle
-func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
-	pipe := q.rdb.TxPipeline()
-	pipe.HIncrBy(ctx, q.name+":count", field, 1)
-	pipe.Set(ctx, q.name+":live", time.Now(), 0)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		q.log.Errorf("job queue %s count %s failed: %s", q.name, err)
 	}
 }
