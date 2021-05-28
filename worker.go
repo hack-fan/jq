@@ -14,6 +14,9 @@ import (
 // Notice: It must be thread safe, since it will be called parallel.
 type HandlerFunc func(job *Job) error
 
+// ReportFunc work together with worker options "Idle",custom your counter report.
+type ReportFunc func(status *Status)
+
 // WorkerOptions is optional when starting a worker
 type WorkerOptions struct {
 	// If job handler fails,max retry these times. Default:10
@@ -25,7 +28,7 @@ type WorkerOptions struct {
 	// If the workers are inactive during these duration, watcher will clear count and make a report. Default: 3min
 	Idle time.Duration
 	// Working together with "Idle",custom your report.
-	ReportFunc func(status *Status)
+	Reporter ReportFunc
 	// If a redis server error occurred, wait and retry. Default: 1min
 	Recover time.Duration
 	// If a job exceeds the max retry time, save it to dropped queue, or really dropped.
@@ -80,14 +83,14 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 			return
 		default:
 			// Make a report if the queue has been idle for a while
-			if opt.ReportFunc != nil && q.activeAt().Add(opt.Idle).Before(time.Now()) {
+			if opt.Reporter != nil && q.activeAt().Add(opt.Idle).Before(time.Now()) {
 				status, err := q.Status()
 				if err != nil {
 					q.log.Errorf("queue %s get status failed:%s", q.name, err)
 				} else {
 					if status.IsRunning {
 						q.reset()
-						opt.ReportFunc(status)
+						opt.Reporter(status)
 					}
 				}
 			}
@@ -101,7 +104,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 			go func() {
 				defer sem.Release(1)
 				// Step 1: Get job
-				job, err := q.Get(ctx)
+				job, err := q.Get()
 				if errors.Is(err, redis.Nil) {
 					// Empty queue, wait a while
 					sleep(ctx, opt.Interval)
@@ -115,18 +118,18 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 					sleep(ctx, opt.Recover)
 					return
 				}
-				q.count(ctx, "process", opt)
+				q.count("process")
 				// Step 2: Handle job
 				start := time.Now()
 				err = handle(job)
 				if err != nil {
 					q.log.Errorf("[%s] job [%s] used %s failed: %s", q.name, job.ID, time.Since(start), err)
 					// Count failed
-					q.count(ctx, "failed", opt)
+					q.count("failed")
 					// Retry or not
 					if job.Retried >= opt.MaxRetry {
 						q.log.Errorf("[%s] job [%s] retry limit exceeded: %s", q.name, job.ID, time.Since(start))
-						q.count(ctx, "dropped", opt)
+						q.count("dropped")
 						q.Drop(job)
 						return
 					}
@@ -135,7 +138,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 				}
 				q.log.Infof("[%s] job [%s] used %s", q.name, job.ID, time.Since(start))
 				// Count success
-				q.count(ctx, "success", opt)
+				q.count("success")
 			}()
 		}
 	}

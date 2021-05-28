@@ -59,7 +59,8 @@ func (q *Queue) Status() (*Status, error) {
 
 // count process,success,failed,dropped jobs
 // the value will be cleared when idle time reached opt.Idle
-func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
+func (q *Queue) count(field string) {
+	ctx := context.Background()
 	pipe := q.rdb.TxPipeline()
 	pipe.HIncrBy(ctx, q.name+":count", field, 1)
 	pipe.Set(ctx, q.name+":active", time.Now(), 0)

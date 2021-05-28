@@ -67,8 +67,8 @@ func (q *Queue) publish(queue string, job *Job) error {
 // The error returned would be redis.Nil, use errors.Is to check it.
 // This function is not normally used, unless you want to write your own worker.
 // You can use our out of box StartWorker()
-func (q *Queue) Get(ctx context.Context) (*Job, error) {
-	data, err := q.rdb.RPop(ctx, q.name+":queue").Bytes()
+func (q *Queue) Get() (*Job, error) {
+	data, err := q.rdb.RPop(context.Background(), q.name+":queue").Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("get job from redis failed: %w", err)
 	}
