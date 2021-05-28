@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -54,4 +55,13 @@ func (q *Queue) Status() (*Status, error) {
 	status.Total = status.Success + status.Dropped
 	status.IsRunning = true
 	return status, nil
+}
+
+func (q *Queue) activeAt() time.Time {
+	var res = time.Now()
+	err := q.rdb.Get(context.Background(), q.name+":active").Scan(&res)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		q.log.Errorf("queue %s get active time failed:%s", q.name, err)
+	}
+	return res
 }

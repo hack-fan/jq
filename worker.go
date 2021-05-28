@@ -22,8 +22,10 @@ type WorkerOptions struct {
 	Parallel int64
 	// If there is no job, worker will take a break Default: 3s
 	Interval time.Duration
-	// If the workers are inactive during these duration, watcher will do a report. Default: 3min
+	// If the workers are inactive during these duration, watcher will clear count and do a report. Default: 3min
 	Idle time.Duration
+	// Working together with "Idle",custom your report.
+	ReportFunc func(status *Status)
 	// If a redis server error occurred, wait and retry. Default: 1min
 	Recover time.Duration
 	// If a job exceeds the max retry time, save it to dropped queue, or really dropped.
@@ -77,6 +79,17 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 			q.log.Infof("job queue %s stopped by context done signal", q.name)
 			return
 		default:
+			// Make a report if the queue has been idle for a while
+			if opt.ReportFunc != nil {
+				if q.activeAt().Add(opt.Idle).Before(time.Now()) {
+					status, err := q.Status()
+					if err != nil {
+						q.log.Errorf("queue %s get status failed:%s", q.name, err)
+					} else {
+						opt.ReportFunc(status)
+					}
+				}
+			}
 			// Acquire sem, the only error here will be context error,
 			// continue for done case if it happens.
 			err := sem.Acquire(ctx, 1)
@@ -130,10 +143,9 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 // count process,success,failed,dropped jobs
 // the value will be cleared when idle time reached opt.Idle
 func (q *Queue) count(ctx context.Context, field string, opt *WorkerOptions) {
-	key := q.name + ":count"
 	pipe := q.rdb.TxPipeline()
-	pipe.HIncrBy(ctx, key, field, 1)
-	pipe.Expire(ctx, key, opt.Idle)
+	pipe.HIncrBy(ctx, q.name+":count", field, 1)
+	pipe.Set(ctx, q.name+":live", time.Now(), 0)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		q.log.Errorf("job queue %s count %s failed: %s", q.name, err)
