@@ -67,6 +67,7 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 	opt.ensure()
 	// Wait group
 	if opt.WG != nil {
+		opt.WG.Add(1)
 		defer opt.WG.Done()
 	}
 	// overwrite logger
