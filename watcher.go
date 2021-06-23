@@ -76,6 +76,10 @@ func (q *Queue) reset() {
 	if err != nil {
 		q.log.Errorf("queue %s reset counter failed:%s", q.name, err)
 	}
+	err = q.rdb.Del(context.Background(), q.name+":active").Err()
+	if err != nil {
+		q.log.Errorf("queue %s reset active failed:%s", q.name, err)
+	}
 }
 
 func (q *Queue) activeAt() time.Time {
