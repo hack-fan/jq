@@ -45,7 +45,7 @@ func (opt *WorkerOptions) ensure() {
 		*opt = WorkerOptions{}
 	}
 	if opt.MaxRetry == 0 {
-		opt.MaxRetry = 10
+		opt.MaxRetry = 3
 	}
 	if opt.Parallel == 0 {
 		opt.Parallel = 2

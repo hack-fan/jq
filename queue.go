@@ -85,7 +85,7 @@ func (q *Queue) Get() (*Job, error) {
 // This function is not normally used, unless you want to write your own worker.
 // You can use our out of box StartWorker()
 func (q *Queue) Retry(ctx context.Context, job *Job) {
-	sleep(ctx, time.Second*time.Duration(job.Retried))
+	sleep(ctx, time.Second*time.Duration(1<<job.Retried))
 	job.Retried += 1
 	err := q.publish(q.name, job)
 	if err != nil {
