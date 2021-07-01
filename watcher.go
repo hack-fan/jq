@@ -47,7 +47,7 @@ func (q *Queue) Status() (*Status, error) {
 		}
 	}
 	if res["dropped"] != "" {
-		status.Process, err = strconv.Atoi(res["dropped"])
+		status.Dropped, err = strconv.Atoi(res["dropped"])
 		if err != nil {
 			return nil, fmt.Errorf("invalid count %s", res["dropped"])
 		}
