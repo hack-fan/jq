@@ -98,6 +98,7 @@ func (q *Queue) Drop(job *Job) {
 	data, err := msgpack.Marshal(job)
 	if err != nil {
 		q.log.Errorf("your payload can not be marshalled by msgpack: %s", err)
+		return
 	}
 	err = q.rdb.LPush(context.Background(), q.name+":dropped", data).Err()
 	if err != nil {

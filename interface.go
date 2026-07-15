@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 // RedisClient is because go-redis has many kind of clients.
@@ -14,7 +14,7 @@ type RedisClient interface {
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
 	HIncrBy(ctx context.Context, key, field string, incr int64) *redis.IntCmd
-	HGetAll(ctx context.Context, key string) *redis.StringStringMapCmd
+	HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd
 	Exists(ctx context.Context, keys ...string) *redis.IntCmd
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
 	LPush(ctx context.Context, key string, values ...interface{}) *redis.IntCmd

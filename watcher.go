@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 type Status struct {
@@ -23,10 +23,12 @@ type Status struct {
 func (q *Queue) Status() (*Status, error) {
 	status := new(Status)
 	res, err := q.rdb.HGetAll(context.Background(), q.name+":count").Result()
-	if errors.Is(err, redis.Nil) {
-		return status, nil
-	} else if err != nil {
+	if err != nil {
 		return nil, err
+	}
+	// HGetAll returns an empty map instead of redis.Nil when the key does not exist.
+	if len(res) == 0 {
+		return status, nil
 	}
 	if res["process"] != "" {
 		status.Process, err = strconv.Atoi(res["process"])
@@ -66,7 +68,7 @@ func (q *Queue) count(field string) {
 	pipe.Set(ctx, q.name+":active", time.Now(), 0)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		q.log.Errorf("job queue %s count %s failed: %s", q.name, err)
+		q.log.Errorf("job queue %s count %s failed: %s", q.name, field, err)
 	}
 }
 

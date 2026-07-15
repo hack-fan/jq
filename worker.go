@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -19,7 +19,7 @@ type ReportFunc func(status *Status)
 
 // WorkerOptions is optional when starting a worker
 type WorkerOptions struct {
-	// If job handler fails,max retry these times. Default:10
+	// If job handler fails,max retry these times. Default:3
 	MaxRetry int
 	// Parallel worker count. Default:2
 	Parallel int64
