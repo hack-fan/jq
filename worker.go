@@ -41,9 +41,6 @@ type WorkerOptions struct {
 }
 
 func (opt *WorkerOptions) ensure() {
-	if opt == nil {
-		*opt = WorkerOptions{}
-	}
 	if opt.MaxRetry == 0 {
 		opt.MaxRetry = 3
 	}
@@ -64,6 +61,9 @@ func (opt *WorkerOptions) ensure() {
 // StartWorker is blocked.
 func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *WorkerOptions) {
 	// Parse options
+	if opt == nil {
+		opt = &WorkerOptions{}
+	}
 	opt.ensure()
 	// Wait group
 	if opt.WG != nil {
@@ -76,10 +76,14 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 	}
 	// Start the ever loop
 	var sem = semaphore.NewWeighted(opt.Parallel)
+	// inner tracks every goroutine this worker spawns (jobs and retries),
+	// so we do not return and release the wait group while work is in flight.
+	var inner sync.WaitGroup
 	q.log.Infof("job queue worker %s start", q.name)
 	for {
 		select {
 		case <-ctx.Done():
+			inner.Wait()
 			q.log.Infof("job queue %s stopped by context done signal", q.name)
 			return
 		default:
@@ -102,16 +106,15 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 				continue
 			}
 			// Async run job for parallel.
+			inner.Add(1)
 			go func() {
+				defer inner.Done()
 				defer sem.Release(1)
 				// Step 1: Get job
 				job, err := q.Get()
 				if errors.Is(err, redis.Nil) {
 					// Empty queue, wait a while
 					sleep(ctx, opt.Interval)
-					return
-				} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					q.log.Infof("context dead: %s", err)
 					return
 				} else if err != nil {
 					q.log.Errorf("job queue %s get job error: %s", q.name, err)
@@ -131,10 +134,16 @@ func (q *Queue) StartWorker(ctx context.Context, handle HandlerFunc, opt *Worker
 					if job.Retried >= opt.MaxRetry {
 						q.log.Errorf("[%s] job [%s] retry limit exceeded: %s", q.name, job.ID, time.Since(start))
 						q.count("dropped")
-						q.Drop(job)
+						if opt.SafeDrop {
+							q.Drop(job)
+						}
 						return
 					}
-					go q.Retry(ctx, job)
+					inner.Add(1)
+					go func() {
+						defer inner.Done()
+						q.Retry(ctx, job)
+					}()
 					return
 				}
 				q.log.Infof("[%s] job [%s] used %s", q.name, job.ID, time.Since(start))

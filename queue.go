@@ -9,6 +9,10 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// retryInterval is how long Retry waits between failed republish attempts.
+// It is a variable so tests can shorten it.
+var retryInterval = time.Minute
+
 // Queue is just one queue
 type Queue struct {
 	name string
@@ -85,15 +89,26 @@ func (q *Queue) Get() (*Job, error) {
 // This function is not normally used, unless you want to write your own worker.
 // You can use our out of box StartWorker()
 func (q *Queue) Retry(ctx context.Context, job *Job) {
-	sleep(ctx, time.Second*time.Duration(1<<job.Retried))
+	sleep(ctx, backoff(job.Retried))
 	job.Retried += 1
-	err := q.publish(q.name, job)
-	if err != nil {
+	// Keep trying while redis is unreachable, give up only when context is done,
+	// so a transient redis error does not lose the job.
+	for {
+		err := q.publish(q.name, job)
+		if err == nil {
+			return
+		}
 		q.log.Errorf("send retry job %s to queue %s failed: %s", job.ID, q.name, err)
+		if ctx.Err() != nil {
+			q.log.Errorf("retry job %s is lost: %s", job.ID, ctx.Err())
+			return
+		}
+		sleep(ctx, retryInterval)
 	}
 }
 
-// Drop the job,put it to drop queue,if SafeDrop is true.
+// Drop the job, put it to the dropped queue.
+// The worker calls it only when SafeDrop is true.
 func (q *Queue) Drop(job *Job) {
 	data, err := msgpack.Marshal(job)
 	if err != nil {
@@ -104,6 +119,12 @@ func (q *Queue) Drop(job *Job) {
 	if err != nil {
 		q.log.Errorf("push job to redis failed: %s", err)
 	}
+}
+
+// backoff returns the exponential retry delay,
+// capped so a big retried count can not overflow or sleep for days.
+func backoff(retried int) time.Duration {
+	return time.Second * time.Duration(1<<min(retried, 10))
 }
 
 // sleep to ctx done or duration, the lesser one.
