@@ -6,7 +6,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// Job is what redis stored in list
+// Job is the envelope stored in the Redis list.
 type Job struct {
 	ID      string
 	PubAt   time.Time
@@ -14,7 +14,8 @@ type Job struct {
 	Payload []byte
 }
 
-// Bind job payload to target, make sure the target is a pointer, same as you published before.
-func (j *Job) Bind(v interface{}) error {
+// Bind decodes the job payload into v, which must be a pointer to the same
+// type that was published.
+func (j *Job) Bind(v any) error {
 	return msgpack.Unmarshal(j.Payload, v)
 }

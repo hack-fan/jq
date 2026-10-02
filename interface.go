@@ -7,32 +7,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisClient is because go-redis has many kind of clients.
+// RedisClient is the subset of go-redis used by this package, so any of the
+// go-redis client types (Client, ClusterClient, Ring, UniversalClient) fits.
 type RedisClient interface {
 	Get(ctx context.Context, key string) *redis.StringCmd
-	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd
+	Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
-	Incr(ctx context.Context, key string) *redis.IntCmd
 	HIncrBy(ctx context.Context, key, field string, incr int64) *redis.IntCmd
 	HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd
-	Exists(ctx context.Context, keys ...string) *redis.IntCmd
-	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
-	LPush(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
+	LPush(ctx context.Context, key string, values ...any) *redis.IntCmd
 	RPop(ctx context.Context, key string) *redis.StringCmd
 	LLen(ctx context.Context, key string) *redis.IntCmd
-	TxPipeline() redis.Pipeliner
+	Pipeline() redis.Pipeliner
 }
-
-// Logger can be logrus or zap sugared logger, or your own.
-type Logger interface {
-	Debugf(format string, args ...interface{})
-	Infof(format string, args ...interface{})
-	Errorf(format string, args ...interface{})
-}
-
-// defaultLogger do nothing
-type defaultLogger struct{}
-
-func (defaultLogger) Debugf(_ string, _ ...interface{}) {}
-func (defaultLogger) Infof(_ string, _ ...interface{})  {}
-func (defaultLogger) Errorf(_ string, _ ...interface{}) {}

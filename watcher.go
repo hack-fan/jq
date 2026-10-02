@@ -10,85 +10,85 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Status holds the counters collected since the last reset.
 type Status struct {
+	// IsRunning is false when no counter exists, i.e. nothing happened since
+	// the last reset.
 	IsRunning bool
 	Process   int
 	Success   int
 	Failed    int
 	Dropped   int
-	Total     int
+	// Total is Success + Dropped: jobs that reached a final state.
+	Total int
 }
 
-// Status of the queue
-func (q *Queue) Status() (*Status, error) {
-	status := new(Status)
-	res, err := q.rdb.HGetAll(context.Background(), q.name+":count").Result()
+// Status returns the counters of the queue.
+func (q *Queue) Status(ctx context.Context) (*Status, error) {
+	res, err := q.rdb.HGetAll(ctx, q.keys.count).Result()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("jq: get counters: %w", err)
 	}
+	status := new(Status)
 	// HGetAll returns an empty map instead of redis.Nil when the key does not exist.
 	if len(res) == 0 {
 		return status, nil
 	}
-	if res["process"] != "" {
-		status.Process, err = strconv.Atoi(res["process"])
-		if err != nil {
-			return nil, fmt.Errorf("invalid count %s", res["process"])
-		}
+	fields := []struct {
+		name string
+		dst  *int
+	}{
+		{"process", &status.Process},
+		{"success", &status.Success},
+		{"failed", &status.Failed},
+		{"dropped", &status.Dropped},
 	}
-	if res["success"] != "" {
-		status.Success, err = strconv.Atoi(res["success"])
-		if err != nil {
-			return nil, fmt.Errorf("invalid count %s", res["success"])
+	for _, f := range fields {
+		raw := res[f.name]
+		if raw == "" {
+			continue
 		}
-	}
-	if res["failed"] != "" {
-		status.Failed, err = strconv.Atoi(res["failed"])
+		n, err := strconv.Atoi(raw)
 		if err != nil {
-			return nil, fmt.Errorf("invalid count %s", res["failed"])
+			return nil, fmt.Errorf("jq: invalid %s count %q", f.name, raw)
 		}
-	}
-	if res["dropped"] != "" {
-		status.Dropped, err = strconv.Atoi(res["dropped"])
-		if err != nil {
-			return nil, fmt.Errorf("invalid count %s", res["dropped"])
-		}
+		*f.dst = n
 	}
 	status.Total = status.Success + status.Dropped
 	status.IsRunning = true
 	return status, nil
 }
 
-// count process,success,failed,dropped jobs
-// the value will be cleared when idle time reached opt.Idle
-func (q *Queue) count(field string) {
-	ctx := context.Background()
-	pipe := q.rdb.TxPipeline()
-	pipe.HIncrBy(ctx, q.name+":count", field, 1)
-	pipe.Set(ctx, q.name+":active", time.Now(), 0)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		q.log.Errorf("job queue %s count %s failed: %s", q.name, field, err)
+// count increments one of the process/success/failed/dropped counters and
+// records the time of the activity.
+func (q *Queue) count(ctx context.Context, field string) {
+	pipe := q.rdb.Pipeline()
+	pipe.HIncrBy(ctx, q.keys.count, field, 1)
+	pipe.Set(ctx, q.keys.active, time.Now(), 0)
+	if _, err := pipe.Exec(ctx); err != nil {
+		q.log.Error("count failed", "field", field, "err", err)
 	}
 }
 
-// reset the counter
-func (q *Queue) reset() {
-	err := q.rdb.Del(context.Background(), q.name+":count").Err()
-	if err != nil {
-		q.log.Errorf("queue %s reset counter failed:%s", q.name, err)
-	}
-	err = q.rdb.Del(context.Background(), q.name+":active").Err()
-	if err != nil {
-		q.log.Errorf("queue %s reset active failed:%s", q.name, err)
+// reset deletes the counters and the activity timestamp.
+// Two single-key DELs in one pipeline, so it also works on Redis Cluster
+// where the keys may live in different slots.
+func (q *Queue) reset(ctx context.Context) {
+	pipe := q.rdb.Pipeline()
+	pipe.Del(ctx, q.keys.count)
+	pipe.Del(ctx, q.keys.active)
+	if _, err := pipe.Exec(ctx); err != nil {
+		q.log.Error("reset counters failed", "err", err)
 	}
 }
 
-func (q *Queue) activeAt() time.Time {
-	var res = time.Now()
-	err := q.rdb.Get(context.Background(), q.name+":active").Scan(&res)
+// activeAt returns the time of the last counted activity. It falls back to
+// now when unknown, so the idle reporter does not fire on a queue that never ran.
+func (q *Queue) activeAt(ctx context.Context) time.Time {
+	res := time.Now()
+	err := q.rdb.Get(ctx, q.keys.active).Scan(&res)
 	if err != nil && !errors.Is(err, redis.Nil) {
-		q.log.Errorf("queue %s get active time failed:%s", q.name, err)
+		q.log.Error("get active time failed", "err", err)
 	}
 	return res
 }

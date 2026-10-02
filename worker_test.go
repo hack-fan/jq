@@ -3,57 +3,33 @@ package jq
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func fastOptions(wg *sync.WaitGroup) *WorkerOptions {
-	return &WorkerOptions{
-		MaxRetry: 1,
-		Parallel: 2,
-		Interval: 30 * time.Millisecond,
-		Recover:  100 * time.Millisecond,
-		WG:       wg,
-	}
-}
-
-// waitGroupReleased asserts wg.Wait returns within timeout.
-func waitGroupReleased(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
-	t.Helper()
-	awaitReturn(t, timeout, "wait group release", wg.Wait)
-}
-
 func TestWorkerProcessesJobs(t *testing.T) {
 	q, _, _ := newTestQueue(t, "work")
-	for i := 0; i < 3; i++ {
-		if _, err := q.Pub(testPayload{Name: "n", Count: i}); err != nil {
-			t.Fatalf("pub: %s", err)
-		}
-	}
-	var handled int32
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	go q.StartWorker(ctx, func(job *Job) error {
+	mustPub(t, q, testPayload{Count: 0}, testPayload{Count: 1}, testPayload{Count: 2})
+	var handled atomic.Int32
+	cancel, wait := startWorker(t, q, func(_ context.Context, job *Job) error {
 		var p testPayload
 		if err := job.Bind(&p); err != nil {
 			return err
 		}
-		atomic.AddInt32(&handled, 1)
+		handled.Add(1)
 		return nil
-	}, fastOptions(&wg))
+	}, fastOptions())
 
 	waitFor(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&handled) == 3
+		return handled.Load() == 3
 	}, "3 jobs handled")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 
-	status, err := q.Status()
-	if err != nil {
-		t.Fatalf("status: %s", err)
-	}
+	status := mustStatus(t, q)
 	if status.Process != 3 || status.Success != 3 || status.Failed != 0 {
 		t.Fatalf("unexpected status: %+v", status)
 	}
@@ -64,33 +40,25 @@ func TestWorkerProcessesJobs(t *testing.T) {
 func testWorkerRetryThenDrop(t *testing.T, safeDrop bool) {
 	t.Helper()
 	q, rdb, _ := newTestQueue(t, "faildrop")
-	if _, err := q.Pub("bad"); err != nil {
-		t.Fatalf("pub: %s", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	opt := fastOptions(&wg)
+	mustPub(t, q, "bad")
+	opt := fastOptions()
 	opt.SafeDrop = safeDrop
-	go q.StartWorker(ctx, func(*Job) error {
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
 		return errors.New("boom")
 	}, opt)
 
 	// first failure, 1s retry backoff, second failure, then dropped
 	waitFor(t, 5*time.Second, func() bool {
-		status, err := q.Status()
+		status, err := q.Status(t.Context())
 		return err == nil && status.Dropped == 1
 	}, "job dropped")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 
-	status, err := q.Status()
-	if err != nil {
-		t.Fatalf("status: %s", err)
-	}
-	if status.Failed != 2 {
+	if status := mustStatus(t, q); status.Failed != 2 {
 		t.Fatalf("want 2 failures (initial + 1 retry), got %+v", status)
 	}
-	n, err := rdb.LLen(context.Background(), "faildrop:dropped").Result()
+	n, err := rdb.LLen(t.Context(), "faildrop:dropped").Result()
 	if err != nil {
 		t.Fatalf("llen: %s", err)
 	}
@@ -110,36 +78,27 @@ func TestWorkerDropSafe(t *testing.T)   { testWorkerRetryThenDrop(t, true) }
 // not dropped, and leave no queue behind.
 func TestWorkerFailOnceThenSucceed(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "flaky")
-	if _, err := q.Pub("x"); err != nil {
-		t.Fatalf("pub: %s", err)
-	}
-	var handled int32
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	go q.StartWorker(ctx, func(job *Job) error {
+	mustPub(t, q, "x")
+	var handled atomic.Int32
+	cancel, wait := startWorker(t, q, func(_ context.Context, job *Job) error {
 		if job.Retried == 0 {
 			return errors.New("first attempt fails")
 		}
-		atomic.AddInt32(&handled, 1)
+		handled.Add(1)
 		return nil
-	}, fastOptions(&wg))
+	}, fastOptions())
 
 	// first failure, 1s retry backoff, then success
 	waitFor(t, 5*time.Second, func() bool {
-		return atomic.LoadInt32(&handled) == 1
+		return handled.Load() == 1
 	}, "retried job handled")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 
-	status, err := q.Status()
-	if err != nil {
-		t.Fatalf("status: %s", err)
-	}
-	if status.Success != 1 || status.Failed != 1 || status.Dropped != 0 {
+	if status := mustStatus(t, q); status.Success != 1 || status.Failed != 1 || status.Dropped != 0 {
 		t.Fatalf("unexpected status: %+v", status)
 	}
-	n, _ := rdb.LLen(context.Background(), "flaky:dropped").Result()
-	if n != 0 {
+	if n, _ := rdb.LLen(t.Context(), "flaky:dropped").Result(); n != 0 {
 		t.Fatalf("nothing should be dropped, got %d", n)
 	}
 }
@@ -148,92 +107,136 @@ func TestWorkerFailOnceThenSucceed(t *testing.T) {
 // opt.Recover and picks the job up once redis is back.
 func TestWorkerRecoversFromRedisError(t *testing.T) {
 	q, _, mr := newTestQueue(t, "recover")
-	if _, err := q.Pub("x"); err != nil {
-		t.Fatalf("pub: %s", err)
-	}
+	mustPub(t, q, "x")
 	mr.SetError("redis is down")
 	timer := time.AfterFunc(250*time.Millisecond, func() { mr.SetError("") })
 	defer timer.Stop()
 
-	var handled int32
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	go q.StartWorker(ctx, func(*Job) error {
-		atomic.AddInt32(&handled, 1)
+	var handled atomic.Int32
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
+		handled.Add(1)
 		return nil
-	}, fastOptions(&wg))
+	}, fastOptions())
 
 	waitFor(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&handled) == 1
+		return handled.Load() == 1
 	}, "job handled after redis recovered")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 }
 
-type recordLogger struct {
-	infos int32
-}
-
-func (*recordLogger) Debugf(string, ...interface{})  {}
-func (l *recordLogger) Infof(string, ...interface{}) { atomic.AddInt32(&l.infos, 1) }
-func (*recordLogger) Errorf(string, ...interface{})  {}
-
-// The Logger option must replace the default silent logger.
-func TestWorkerCustomLogger(t *testing.T) {
-	q, _, _ := newTestQueue(t, "logger")
-	lg := new(recordLogger)
-	ctx, cancel := context.WithCancel(context.Background())
+// The worker logs through the queue logger, and a clean shutdown logs no error.
+func TestWorkerLogs(t *testing.T) {
+	h := new(countingHandler)
+	q, _, _ := newTestQueue(t, "logger", WithLogger(slog.New(h)))
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	timer := time.AfterFunc(100*time.Millisecond, cancel)
-	defer timer.Stop()
-	opt := fastOptions(nil)
-	opt.Logger = lg
 	awaitReturn(t, 2*time.Second, "worker stop", func() {
-		q.StartWorker(ctx, func(*Job) error { return nil }, opt)
+		q.StartWorker(ctx, func(context.Context, *Job) error { return nil }, fastOptions())
 	})
-	if atomic.LoadInt32(&lg.infos) == 0 {
+	if h.infos.Load() == 0 {
 		t.Fatal("custom logger was never used")
+	}
+	if h.errors.Load() != 0 {
+		t.Fatalf("a clean shutdown should not log errors, got %d", h.errors.Load())
 	}
 }
 
 // StartWorker with nil options must not panic and must stop on cancel.
 func TestWorkerNilOptions(t *testing.T) {
 	q, _, _ := newTestQueue(t, "nilopt")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	timer := time.AfterFunc(100*time.Millisecond, cancel)
-	defer timer.Stop()
 	awaitReturn(t, 2*time.Second, "worker stop with nil options", func() {
-		q.StartWorker(ctx, func(*Job) error { return nil }, nil)
+		q.StartWorker(ctx, func(context.Context, *Job) error { return nil }, nil)
 	})
+}
+
+// StartWorker must not modify the caller's options, so one struct can be
+// shared between workers.
+func TestWorkerDoesNotMutateOptions(t *testing.T) {
+	q, _, _ := newTestQueue(t, "optcopy")
+	opt := &WorkerOptions{}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	awaitReturn(t, 2*time.Second, "worker stop", func() {
+		q.StartWorker(ctx, func(context.Context, *Job) error { return nil }, opt)
+	})
+	if opt.MaxRetry != 0 || opt.Parallel != 0 || opt.Interval != 0 || opt.Idle != 0 || opt.Recover != 0 {
+		t.Fatalf("options were mutated: %+v", opt)
+	}
+}
+
+// The reporter must not fire while a handler is still running, even if the
+// queue is empty and the last counter update is older than Idle.
+func TestWorkerNoReportWhileJobInFlight(t *testing.T) {
+	q, _, _ := newTestQueue(t, "inflightreport")
+	mustPub(t, q, "slow")
+	var reports atomic.Int32
+	release := make(chan struct{})
+	opt := fastOptions()
+	opt.Idle = 100 * time.Millisecond
+	opt.Reporter = func(*Status) { reports.Add(1) }
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
+		<-release
+		return nil
+	}, opt)
+
+	// Well past Idle with the queue empty, but the job is still running.
+	time.Sleep(400 * time.Millisecond)
+	if n := reports.Load(); n != 0 {
+		t.Fatalf("reporter fired %d times while a job was in flight", n)
+	}
+	close(release)
+	waitFor(t, 3*time.Second, func() bool { return reports.Load() == 1 }, "reporter fired after the job finished")
+	cancel()
+	wait()
+	if status := mustStatus(t, q); status.IsRunning {
+		t.Fatalf("counters should be reset after report, got %+v", status)
+	}
+}
+
+// The handler receives the worker context, so it can observe shutdown, and
+// the outcome of a job that finishes during shutdown is still counted.
+func TestWorkerHandlerContext(t *testing.T) {
+	q, _, _ := newTestQueue(t, "handlerctx")
+	mustPub(t, q, "x")
+	started := make(chan struct{})
+	sawCancel := make(chan struct{})
+	cancel, wait := startWorker(t, q, func(hctx context.Context, _ *Job) error {
+		close(started)
+		<-hctx.Done()
+		close(sawCancel)
+		return nil
+	}, fastOptions())
+
+	awaitReturn(t, 3*time.Second, "job start", func() { <-started })
+	cancel()
+	awaitReturn(t, 3*time.Second, "handler context cancelled with the worker", func() { <-sawCancel })
+	wait()
+	if status := mustStatus(t, q); status.Success != 1 {
+		t.Fatalf("job finished during shutdown should be counted, got %+v", status)
+	}
 }
 
 // Shutdown must wait for a running handler before releasing the wait group,
 // so the caller can exit without abandoning a job mid-flight.
 func TestWorkerDrainsInFlightJob(t *testing.T) {
 	q, _, _ := newTestQueue(t, "drain")
-	if _, err := q.Pub("slow"); err != nil {
-		t.Fatalf("pub: %s", err)
-	}
-	var finished int32
+	mustPub(t, q, "slow")
+	var finished atomic.Bool
 	started := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	go q.StartWorker(ctx, func(*Job) error {
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
 		close(started)
 		time.Sleep(500 * time.Millisecond)
-		atomic.StoreInt32(&finished, 1)
+		finished.Store(true)
 		return nil
-	}, fastOptions(&wg))
+	}, fastOptions())
 
-	select {
-	case <-started: // handler is now mid-flight
-	case <-time.After(3 * time.Second):
-		t.Fatal("job never started")
-	}
+	awaitReturn(t, 3*time.Second, "job start", func() { <-started })
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
-	if atomic.LoadInt32(&finished) != 1 {
+	wait()
+	if !finished.Load() {
 		t.Fatal("wait group released before the in-flight job finished")
 	}
 }
@@ -241,32 +244,27 @@ func TestWorkerDrainsInFlightJob(t *testing.T) {
 // The Parallel option must bound how many handlers run at once.
 func TestWorkerParallelLimit(t *testing.T) {
 	q, _, _ := newTestQueue(t, "parallel")
-	for i := 0; i < 3; i++ {
-		if _, err := q.Pub(i); err != nil {
-			t.Fatalf("pub: %s", err)
-		}
-	}
-	var inflight, over, handled int32
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	opt := fastOptions(&wg)
+	mustPub(t, q, 0, 1, 2)
+	var inflight, handled atomic.Int32
+	var over atomic.Bool
+	opt := fastOptions()
 	opt.Parallel = 1
-	go q.StartWorker(ctx, func(*Job) error {
-		if atomic.AddInt32(&inflight, 1) > 1 {
-			atomic.StoreInt32(&over, 1)
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
+		if inflight.Add(1) > 1 {
+			over.Store(true)
 		}
 		time.Sleep(80 * time.Millisecond)
-		atomic.AddInt32(&inflight, -1)
-		atomic.AddInt32(&handled, 1)
+		inflight.Add(-1)
+		handled.Add(1)
 		return nil
 	}, opt)
 
 	waitFor(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&handled) == 3
+		return handled.Load() == 3
 	}, "3 jobs handled")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
-	if atomic.LoadInt32(&over) != 0 {
+	wait()
+	if over.Load() {
 		t.Fatal("Parallel=1: more than 1 handler ran concurrently")
 	}
 }
@@ -274,26 +272,20 @@ func TestWorkerParallelLimit(t *testing.T) {
 // Parallel=2 must actually run handlers concurrently, not serialize them.
 func TestWorkerParallelConcurrency(t *testing.T) {
 	q, _, _ := newTestQueue(t, "parallel2")
-	for i := 0; i < 2; i++ {
-		if _, err := q.Pub(i); err != nil {
-			t.Fatalf("pub: %s", err)
-		}
-	}
-	var inflight int32
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	go q.StartWorker(ctx, func(*Job) error {
-		atomic.AddInt32(&inflight, 1)
-		defer atomic.AddInt32(&inflight, -1)
+	mustPub(t, q, 0, 1)
+	var inflight atomic.Int32
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error {
+		inflight.Add(1)
+		defer inflight.Add(-1)
 		time.Sleep(500 * time.Millisecond)
 		return nil
-	}, fastOptions(&wg))
+	}, fastOptions())
 
 	waitFor(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&inflight) == 2
+		return inflight.Load() == 2
 	}, "2 handlers running concurrently")
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 }
 
 // After the queue has been idle for opt.Idle, the reporter fires once with the
@@ -301,15 +293,11 @@ func TestWorkerParallelConcurrency(t *testing.T) {
 // all-zero status.
 func TestWorkerIdleReporter(t *testing.T) {
 	q, _, _ := newTestQueue(t, "report")
-	if _, err := q.Pub("one"); err != nil {
-		t.Fatalf("pub: %s", err)
-	}
+	mustPub(t, q, "one")
 	var mu sync.Mutex
 	var calls int
 	var reported *Status
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	opt := fastOptions(&wg)
+	opt := fastOptions()
 	opt.Idle = 300 * time.Millisecond
 	opt.Reporter = func(status *Status) {
 		mu.Lock()
@@ -317,7 +305,7 @@ func TestWorkerIdleReporter(t *testing.T) {
 		calls++
 		reported = status
 	}
-	go q.StartWorker(ctx, func(*Job) error { return nil }, opt)
+	cancel, wait := startWorker(t, q, func(context.Context, *Job) error { return nil }, opt)
 
 	waitFor(t, 3*time.Second, func() bool {
 		mu.Lock()
@@ -337,13 +325,9 @@ func TestWorkerIdleReporter(t *testing.T) {
 		t.Fatalf("unexpected reported status: %+v", gotReported)
 	}
 	cancel()
-	waitGroupReleased(t, &wg, 3*time.Second)
+	wait()
 
-	status, err := q.Status()
-	if err != nil {
-		t.Fatalf("status: %s", err)
-	}
-	if status.IsRunning {
+	if status := mustStatus(t, q); status.IsRunning {
 		t.Fatalf("counters should be reset after report, got %+v", status)
 	}
 }

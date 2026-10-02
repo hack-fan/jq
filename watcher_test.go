@@ -1,7 +1,6 @@
 package jq
 
 import (
-	"context"
 	"testing"
 	"time"
 )
@@ -10,7 +9,7 @@ import (
 // not redis.Nil, when the count key does not exist.
 func TestStatusFreshQueue(t *testing.T) {
 	q, _, _ := newTestQueue(t, "fresh")
-	status, err := q.Status()
+	status, err := q.Status(t.Context())
 	if err != nil {
 		t.Fatalf("status: %s", err)
 	}
@@ -24,12 +23,13 @@ func TestStatusFreshQueue(t *testing.T) {
 
 func TestCountAndStatus(t *testing.T) {
 	q, _, _ := newTestQueue(t, "count")
-	q.count("process")
-	q.count("process")
-	q.count("success")
-	q.count("failed")
-	q.count("dropped")
-	status, err := q.Status()
+	ctx := t.Context()
+	q.count(ctx, "process")
+	q.count(ctx, "process")
+	q.count(ctx, "success")
+	q.count(ctx, "failed")
+	q.count(ctx, "dropped")
+	status, err := q.Status(ctx)
 	if err != nil {
 		t.Fatalf("status: %s", err)
 	}
@@ -47,10 +47,11 @@ func TestCountAndStatus(t *testing.T) {
 func TestStatusInvalidCount(t *testing.T) {
 	for _, field := range []string{"process", "success", "failed", "dropped"} {
 		q, rdb, _ := newTestQueue(t, "invalid")
-		if err := rdb.HSet(context.Background(), "invalid:count", field, "abc").Err(); err != nil {
+		ctx := t.Context()
+		if err := rdb.HSet(ctx, "invalid:count", field, "abc").Err(); err != nil {
 			t.Fatalf("hset: %s", err)
 		}
-		if _, err := q.Status(); err == nil {
+		if _, err := q.Status(ctx); err == nil {
 			t.Fatalf("status should fail on a non-numeric %s counter", field)
 		}
 	}
@@ -59,23 +60,24 @@ func TestStatusInvalidCount(t *testing.T) {
 func TestStatusRedisDown(t *testing.T) {
 	q, _, mr := newTestQueue(t, "down")
 	mr.SetError("redis is down")
-	if _, err := q.Status(); err == nil {
+	if _, err := q.Status(t.Context()); err == nil {
 		t.Fatal("status should propagate the redis error")
 	}
 }
 
 func TestReset(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "reset")
-	q.count("success")
-	q.reset()
-	status, err := q.Status()
+	ctx := t.Context()
+	q.count(ctx, "success")
+	q.reset(ctx)
+	status, err := q.Status(ctx)
 	if err != nil {
 		t.Fatalf("status: %s", err)
 	}
 	if status.IsRunning || status.Success != 0 {
 		t.Fatalf("reset queue should be fresh, got %+v", status)
 	}
-	n, _ := rdb.Exists(context.Background(), "reset:active").Result()
+	n, _ := rdb.Exists(ctx, "reset:active").Result()
 	if n != 0 {
 		t.Fatal("reset should delete the active key")
 	}
@@ -84,11 +86,12 @@ func TestReset(t *testing.T) {
 // The active timestamp written by count() must round-trip through redis.
 func TestActiveAtRoundTrip(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "active")
+	ctx := t.Context()
 	known := time.Now().Add(-time.Hour)
-	if err := rdb.Set(context.Background(), "active:active", known, 0).Err(); err != nil {
+	if err := rdb.Set(ctx, "active:active", known, 0).Err(); err != nil {
 		t.Fatalf("set: %s", err)
 	}
-	got := q.activeAt()
+	got := q.activeAt(ctx)
 	if !got.Equal(known) {
 		t.Fatalf("activeAt round-trip mismatch: want %s got %s", known, got)
 	}
@@ -98,7 +101,7 @@ func TestActiveAtRoundTrip(t *testing.T) {
 // does not fire on a queue that never ran.
 func TestActiveAtFallback(t *testing.T) {
 	q, _, _ := newTestQueue(t, "noactive")
-	got := q.activeAt()
+	got := q.activeAt(t.Context())
 	if since := time.Since(got); since < 0 || since > 2*time.Second {
 		t.Fatalf("fallback activeAt should be about now, got %s", got)
 	}

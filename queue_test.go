@@ -3,6 +3,7 @@ package jq
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -13,14 +14,18 @@ import (
 
 func TestPubAndGet(t *testing.T) {
 	q, _, _ := newTestQueue(t, "pubget")
-	id, err := q.Pub(testPayload{Name: "a", Count: 1})
+	if q.Name() != "pubget" {
+		t.Fatalf("want name %q, got %q", "pubget", q.Name())
+	}
+	ctx := t.Context()
+	id, err := q.Pub(ctx, testPayload{Name: "a", Count: 1})
 	if err != nil {
 		t.Fatalf("pub: %s", err)
 	}
 	if id == "" {
 		t.Fatal("pub should return a job id")
 	}
-	job, err := q.Get()
+	job, err := q.Get(ctx)
 	if err != nil {
 		t.Fatalf("get: %s", err)
 	}
@@ -42,54 +47,69 @@ func TestPubAndGet(t *testing.T) {
 	}
 }
 
+// An empty queue yields ErrEmpty, which also matches redis.Nil for old callers.
 func TestGetEmpty(t *testing.T) {
 	q, _, _ := newTestQueue(t, "empty")
-	_, err := q.Get()
+	_, err := q.Get(t.Context())
+	if !errors.Is(err, ErrEmpty) {
+		t.Fatalf("want ErrEmpty, got %v", err)
+	}
 	if !errors.Is(err, redis.Nil) {
-		t.Fatalf("want redis.Nil, got %v", err)
+		t.Fatalf("want redis.Nil compatibility, got %v", err)
 	}
 }
 
 func TestGetCorruptJob(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "corrupt")
+	ctx := t.Context()
 	// 0xc1 is a reserved msgpack byte, never valid
-	if err := rdb.LPush(context.Background(), "corrupt:queue", []byte{0xc1}).Err(); err != nil {
+	if err := rdb.LPush(ctx, "corrupt:queue", []byte{0xc1}).Err(); err != nil {
 		t.Fatalf("lpush: %s", err)
 	}
-	_, err := q.Get()
-	if err == nil || errors.Is(err, redis.Nil) {
+	_, err := q.Get(ctx)
+	if err == nil || errors.Is(err, ErrEmpty) {
 		t.Fatalf("corrupt job should fail with an unmarshal error, got %v", err)
 	}
 }
 
 func TestPubTo(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "src")
-	id, err := q.PubTo("dst", "hello")
+	ctx := t.Context()
+	id, err := q.PubTo(ctx, "dst", "hello")
 	if err != nil {
 		t.Fatalf("pubto: %s", err)
 	}
-	job, err := NewQueue("dst", rdb).Get()
+	job, err := NewQueue("dst", rdb).Get(ctx)
 	if err != nil {
 		t.Fatalf("get from dst: %s", err)
 	}
 	if job.ID != id {
 		t.Fatalf("job id mismatch: want %s got %s", id, job.ID)
 	}
-	if _, err := q.Get(); !errors.Is(err, redis.Nil) {
+	if _, err := q.Get(ctx); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("src queue should stay empty, got %v", err)
+	}
+}
+
+func TestLen(t *testing.T) {
+	q, _, _ := newTestQueue(t, "len")
+	ctx := t.Context()
+	if n, err := q.Len(ctx); err != nil || n != 0 {
+		t.Fatalf("empty queue: want 0, got %d (err %v)", n, err)
+	}
+	mustPub(t, q, "x", "x", "x")
+	if n, err := q.Len(ctx); err != nil || n != 3 {
+		t.Fatalf("want 3, got %d (err %v)", n, err)
 	}
 }
 
 // The queue is FIFO: jobs come out in publish order.
 func TestFIFOOrder(t *testing.T) {
 	q, _, _ := newTestQueue(t, "fifo")
-	for _, s := range []string{"a", "b", "c"} {
-		if _, err := q.Pub(s); err != nil {
-			t.Fatalf("pub: %s", err)
-		}
-	}
+	ctx := t.Context()
+	mustPub(t, q, "a", "b", "c")
 	for _, want := range []string{"a", "b", "c"} {
-		job, err := q.Get()
+		job, err := q.Get(ctx)
 		if err != nil {
 			t.Fatalf("get: %s", err)
 		}
@@ -106,20 +126,19 @@ func TestFIFOOrder(t *testing.T) {
 // Pub must be safe to call from many goroutines.
 func TestConcurrentPub(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "conc")
+	ctx := t.Context()
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 10; j++ {
-				if _, err := q.Pub(j); err != nil {
+	for range 10 {
+		wg.Go(func() {
+			for j := range 10 {
+				if _, err := q.Pub(ctx, j); err != nil {
 					t.Errorf("pub: %s", err)
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
-	n, err := rdb.LLen(context.Background(), "conc:queue").Result()
+	n, err := rdb.LLen(ctx, "conc:queue").Result()
 	if err != nil || n != 100 {
 		t.Fatalf("want 100 queued jobs, got %d (err %v)", n, err)
 	}
@@ -127,7 +146,7 @@ func TestConcurrentPub(t *testing.T) {
 
 func TestPubUnmarshalablePayload(t *testing.T) {
 	q, _, _ := newTestQueue(t, "badpayload")
-	if _, err := q.Pub(make(chan int)); err == nil {
+	if _, err := q.Pub(t.Context(), make(chan int)); err == nil {
 		t.Fatal("pub should fail on a payload msgpack can not marshal")
 	}
 }
@@ -135,16 +154,28 @@ func TestPubUnmarshalablePayload(t *testing.T) {
 func TestPubRedisDown(t *testing.T) {
 	q, _, mr := newTestQueue(t, "pubdown")
 	mr.SetError("redis is down")
-	if _, err := q.Pub("x"); err == nil {
+	if _, err := q.Pub(t.Context(), "x"); err == nil {
 		t.Fatal("pub should propagate the redis error")
+	}
+}
+
+func TestPubCancelledContext(t *testing.T) {
+	q, _, _ := newTestQueue(t, "pubcancel")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := q.Pub(ctx, "x"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pub should fail with the context error, got %v", err)
 	}
 }
 
 func TestDrop(t *testing.T) {
 	q, rdb, _ := newTestQueue(t, "drop")
+	ctx := t.Context()
 	job := &Job{ID: "j1", PubAt: time.Now(), Retried: 3, Payload: []byte("x")}
-	q.Drop(job)
-	data, err := rdb.RPop(context.Background(), "drop:dropped").Bytes()
+	if err := q.Drop(ctx, job); err != nil {
+		t.Fatalf("drop: %s", err)
+	}
+	data, err := rdb.RPop(ctx, "drop:dropped").Bytes()
 	if err != nil {
 		t.Fatalf("dropped queue should have the job: %s", err)
 	}
@@ -157,17 +188,27 @@ func TestDrop(t *testing.T) {
 	}
 }
 
+func TestDropRedisDown(t *testing.T) {
+	q, _, mr := newTestQueue(t, "dropdown")
+	mr.SetError("redis is down")
+	if err := q.Drop(t.Context(), &Job{ID: "j1"}); err == nil {
+		t.Fatal("drop should propagate the redis error")
+	}
+}
+
 // Retry with a done context skips the backoff sleep and still republishes,
 // so a worker restart does not lose the job.
 func TestRetryRepublishes(t *testing.T) {
 	q, _, _ := newTestQueue(t, "retry")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	job := &Job{ID: "r1", PubAt: time.Now(), Retried: 1, Payload: []byte("x")}
 	awaitReturn(t, 2*time.Second, "retry with done context", func() {
-		q.Retry(ctx, job)
+		if err := q.Retry(ctx, job); err != nil {
+			t.Errorf("retry: %s", err)
+		}
 	})
-	got, err := q.Get()
+	got, err := q.Get(t.Context())
 	if err != nil {
 		t.Fatalf("get retried job: %s", err)
 	}
@@ -176,13 +217,14 @@ func TestRetryRepublishes(t *testing.T) {
 	}
 }
 
-// The exponential backoff must be capped so a huge retried count can not
-// overflow or produce an absurd delay.
+// The exponential backoff must be clamped so a huge retried count can not
+// produce an absurd delay and a negative one can not panic.
 func TestBackoffCap(t *testing.T) {
 	cases := []struct {
 		retried int
 		want    time.Duration
 	}{
+		{-5, time.Second},
 		{0, time.Second},
 		{3, 8 * time.Second},
 		{10, 1024 * time.Second},
@@ -211,9 +253,11 @@ func TestRetrySurvivesRedisOutage(t *testing.T) {
 
 	job := &Job{ID: "o1", PubAt: time.Now(), Retried: 0, Payload: []byte("x")}
 	awaitReturn(t, 5*time.Second, "retry through redis outage", func() {
-		q.Retry(context.Background(), job)
+		if err := q.Retry(t.Context(), job); err != nil {
+			t.Errorf("retry: %s", err)
+		}
 	})
-	got, err := q.Get()
+	got, err := q.Get(t.Context())
 	if err != nil {
 		t.Fatalf("job should be back in the queue after the outage: %s", err)
 	}
@@ -222,14 +266,28 @@ func TestRetrySurvivesRedisOutage(t *testing.T) {
 	}
 }
 
-// When redis is down and the context is done, Retry gives up instead of hanging.
+// When redis is down and the context is done, Retry gives up with the push
+// error instead of hanging.
 func TestRetryGivesUpOnDoneContext(t *testing.T) {
 	q, _, mr := newTestQueue(t, "giveup")
 	mr.SetError("redis is down")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	job := &Job{ID: "g1", Payload: []byte("x")}
 	awaitReturn(t, 2*time.Second, "retry give-up with redis down and done context", func() {
-		q.Retry(ctx, job)
+		if err := q.Retry(ctx, job); err == nil {
+			t.Error("retry should report the lost job")
+		}
 	})
+}
+
+// WithLogger replaces the default silent logger; a nil logger falls back to it.
+func TestWithLogger(t *testing.T) {
+	h := new(countingHandler)
+	q, _, mr := newTestQueue(t, "logger", WithLogger(nil), WithLogger(slog.New(h)))
+	mr.SetError("redis is down")
+	q.count(t.Context(), "process")
+	if h.errors.Load() == 0 {
+		t.Fatal("custom logger was never used")
+	}
 }
