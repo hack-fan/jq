@@ -3,7 +3,7 @@ module github.com/hack-fan/jq
 go 1.26.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/rs/xid v1.6.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
